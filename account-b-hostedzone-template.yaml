@@ -1,0 +1,28 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Account B hosted zone creation for automatic NS record creation'
+
+Parameters:
+  HostedZone:
+    Type: String
+    Default: 'example.com'
+    Description: 'HostZone Domain in Account A'
+
+Resources:
+  # Route 53 Hosted Zone
+  SubdomainHostedZone:
+    Type: AWS::Route53::HostedZone
+    Properties:
+      Name: !Sub '${AWS::AccountId}.${HostedZone}'
+
+Outputs:
+  HostedZoneId:
+    Description: 'Hosted Zone ID'
+    Value: !Ref SubdomainHostedZone
+  
+  HostedZoneName:
+    Description: 'Hosted Zone Name'
+    Value: !Sub '${AWS::AccountId}.${HostedZone}'
+  
+  NameServers:
+    Description: 'Name Servers'
+    Value: !Join [',', !GetAtt SubdomainHostedZone.NameServers]

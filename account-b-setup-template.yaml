@@ -1,0 +1,179 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Account B setup resources for automatic NS record creation (Lambda and EventBridge)'
+
+Parameters:
+  DynamoDBTableArn:
+    Type: String
+    Default: 'arn:aws:dynamodb:us-east-1:123456789012:table/route53-ns-records-v2'
+    Description: 'ARN of DynamoDB table in Account A'
+
+  HostedZone:
+    Type: String
+    Default: 'example.com'
+    Description: 'HostZone Domain in Account A'
+
+Resources:
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: 'DynamoDBCrossAccountPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:DeleteItem'
+                Resource: !Ref DynamoDBTableArn
+        - PolicyName: 'Route53Policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'route53:GetHostedZone'
+                  - 'route53:ListResourceRecordSets'
+                Resource: '*'
+
+  # Lambda Function
+  EventHandlerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'route53-event-handler-${AWS::AccountId}'
+      Runtime: 'python3.11'
+      Handler: 'index.lambda_handler'
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          DYNAMODB_TABLE_ARN: !Ref DynamoDBTableArn
+          SUBDOMAIN: !Sub '${AWS::AccountId}.${HostedZone}'
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+          
+          # DynamoDB client will be created with target region
+          route53 = boto3.client('route53')
+          
+          def lambda_handler(event, context):
+              print(f"Received event: {json.dumps(event)}")
+              
+              dynamodb_table_arn = os.environ['DYNAMODB_TABLE_ARN']
+              subdomain = os.environ['SUBDOMAIN']
+              account_id = context.invoked_function_arn.split(':')[4]
+              
+              dynamodb = boto3.client('dynamodb')
+              
+              # Get event details
+              detail = event['detail']
+              event_name = detail['eventName']
+              
+              if event_name == 'CreateHostedZone':
+                  # Get hosted zone ID and name servers
+                  hosted_zone_id = detail['responseElements']['hostedZone']['id'].split('/')[-1]
+                  
+                  # Get name servers from Route 53
+                  response = route53.get_hosted_zone(Id=hosted_zone_id)
+                  name_servers = response['DelegationSet']['NameServers']
+                  
+                  # Put item to DynamoDB
+                  try:
+                      timestamp = datetime.utcnow().isoformat() + 'Z'
+                      dynamodb.put_item(
+                          TableName=dynamodb_table_arn,
+                          Item={
+                              'subdomain': {'S': subdomain},
+                              'timestamp': {'S': timestamp},
+                              'account_id': {'S': account_id},
+                              'hosted_zone_id': {'S': hosted_zone_id},
+                              'ns_records': {'SS': name_servers},
+                              'operation': {'S': 'CREATE'}
+                          }
+                      )
+                      print(f"Successfully added NS records for {subdomain}")
+                  except Exception as e:
+                      print(f"Error adding to DynamoDB: {str(e)}")
+                      raise
+              
+              elif event_name == 'DeleteHostedZone':
+                  # Add delete record to DynamoDB
+                  try:
+                      timestamp = datetime.utcnow().isoformat() + 'Z'
+                      dynamodb.put_item(
+                          TableName=dynamodb_table_arn,
+                          Item={
+                              'subdomain': {'S': subdomain},
+                              'timestamp': {'S': timestamp},
+                              'account_id': {'S': account_id},
+                              'operation': {'S': 'DELETE'}
+                          }
+                      )
+                      print(f"Successfully removed NS records for {subdomain}")
+                  except Exception as e:
+                      print(f"Error removing from DynamoDB: {str(e)}")
+                      raise
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps(f'Processed {event_name} for {subdomain}')
+              }
+
+  # EventBridge Rule
+  HostedZoneEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: 'Capture Route 53 Hosted Zone create/delete events'
+      EventPattern:
+        source:
+          - 'aws.route53'
+        detail-type:
+          - 'AWS API Call via CloudTrail'
+        detail:
+          eventSource:
+            - 'route53.amazonaws.com'
+          eventName:
+            - 'CreateHostedZone'
+            - 'DeleteHostedZone'
+          responseElements:
+            hostedZone:
+              name:
+                - !Sub '${AWS::AccountId}.${HostedZone}.'
+      State: 'ENABLED'
+      Targets:
+        - Arn: !GetAtt EventHandlerLambda.Arn
+          Id: 'EventHandlerLambdaTarget'
+
+  # Lambda Permission for EventBridge
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref EventHandlerLambda
+      Action: 'lambda:InvokeFunction'
+      Principal: 'events.amazonaws.com'
+      SourceArn: !GetAtt HostedZoneEventRule.Arn
+
+Outputs:
+  LambdaFunctionArn:
+    Description: 'Lambda Function ARN'
+    Value: !GetAtt EventHandlerLambda.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+  
+  EventRuleArn:
+    Description: 'EventBridge Rule ARN'
+    Value: !GetAtt HostedZoneEventRule.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EventRuleArn'
