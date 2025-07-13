@@ -147,10 +147,6 @@ Resources:
           eventName:
             - 'CreateHostedZone'
             - 'DeleteHostedZone'
-          responseElements:
-            hostedZone:
-              name:
-                - !Sub '${AWS::AccountId}.${HostedZone}.'
       State: 'ENABLED'
       Targets:
         - Arn: !GetAtt EventHandlerLambda.Arn
